@@ -1,0 +1,5 @@
+n_layers: 1
+n_units_l0: 119
+dropout_l0: 0.028735330507266718
+learning_rate: 0.0838905920459873
+batch_size: 46
