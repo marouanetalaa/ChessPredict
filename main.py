@@ -1,138 +1,156 @@
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-import optuna
+from preprocess import preprocess_training_data, preprocess_test_data
 import logging
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 
 # Load data
-data_path = 'lichess_db_puzzle_50000.csv'
+data_path = "lichess_db_puzzle.csv"
 data = pd.read_csv(data_path)
 
-# Basic feature extraction from FEN
-def extract_material_balance(fen):
-    piece_values = {'P': 1, 'N': 3, 'B': 3, 'R': 5, 'Q': 9,
-                    'p': -1, 'n': -3, 'b': -3, 'r': -5, 'q': -9}
-    balance = sum(piece_values.get(piece, 0) for piece in fen.split()[0])
-    return balance
+# Split data into train and test sets
+train_data, test_data = train_test_split(data, test_size=0.2, random_state=42)
 
-def extract_move_count(moves):
-    return len(moves.split())
+# Save the split data to new CSV files for preprocessing
+train_data.to_csv("train_data.csv", index=False)
+test_data.to_csv("test_data.csv", index=False)
 
-data['MaterialBalance'] = data['FEN'].apply(extract_material_balance)
-data['MoveCount'] = data['Moves'].apply(extract_move_count)
-
-# Select relevant features and target
-features = ['MaterialBalance', 'MoveCount']
-X = data[features]
-y = data['Rating']  # Using Rating as the target variable
-
-# Standardize features
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X)
-
-# Split data
-X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
-
-# Convert data to PyTorch tensors
-X_train = torch.tensor(X_train, dtype=torch.float32)
-X_test = torch.tensor(X_test, dtype=torch.float32)
-y_train = torch.tensor(y_train.values, dtype=torch.float32).view(-1, 1)
-y_test = torch.tensor(y_test.values, dtype=torch.float32).view(-1, 1)
 
 # Define Neural Network model
 class NeuralNetwork(nn.Module):
-    def __init__(self, input_dim, trial):
+    def __init__(self, input_dim):
         super(NeuralNetwork, self).__init__()
-        layers = []
-        n_layers = trial.suggest_int('n_layers', 1, 5)
-        for i in range(n_layers):
-            input_dim = input_dim if i == 0 else n_units
-            n_units = trial.suggest_int(f'n_units_l{i}', 4, 128)
-            layers.append(nn.Linear(input_dim, n_units))
-            layers.append(nn.ReLU())
-            dropout_rate = trial.suggest_float(f'dropout_l{i}', 0.0, 0.5)
-            layers.append(nn.Dropout(dropout_rate))
-        layers.append(nn.Linear(n_units, 1))
+        layers = [
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, 1),  # Output layer for regression
+        ]
         self.model = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.model(x)
 
-# Define Objective function for Optuna
-def objective(trial):
-    model = NeuralNetwork(X_train.shape[1], trial).to(device)
-    learning_rate = trial.suggest_float('learning_rate', 1e-5, 1e-1)
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    criterion = nn.MSELoss()
 
-    # DataLoader
-    train_dataset = TensorDataset(X_train, y_train)
-    train_loader = DataLoader(train_dataset, batch_size=trial.suggest_int('batch_size', 16, 128), shuffle=True)
-    
-    model.train()
-    for epoch in range(50):
-        for batch_X, batch_y in train_loader:
-            optimizer.zero_grad()
-            outputs = model(batch_X)
-            loss = criterion(outputs, batch_y)
-            loss.backward()
-            optimizer.step()
+# Train the model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+train_loader = preprocess_training_data("train_data.csv")
+test_loader = preprocess_test_data("test_data.csv")
 
-    # Evaluate the model
-    model.eval()
-    with torch.no_grad():
-        y_pred = model(X_test).cpu().numpy().flatten()
-    mse = mean_squared_error(y_test.cpu().numpy(), y_pred)
-    return mse
-
-# Hyperparameter optimization using Optuna
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-study = optuna.create_study(direction='minimize')
-study.optimize(objective, n_trials=50)
-
-# Save the study results
-study.trials_dataframe().to_csv('optuna_study_results.csv')
-
-# Train the best model
-best_trial = study.best_trial
-best_model = NeuralNetwork(X_train.shape[1], best_trial).to(device)
-learning_rate = best_trial.params['learning_rate']
-optimizer = optim.Adam(best_model.parameters(), lr=learning_rate)
+# Update input_dim to include new features
+input_dim = (
+    64 + 64 * 64 + 3
+)  # 64 for FEN embedding, 64 * 64 for moves embedding, 3 for new features
+model = NeuralNetwork(input_dim).to(device)
+optimizer = optim.Adam(model.parameters(), lr=0.001)
 criterion = nn.MSELoss()
 
-# DataLoader
-train_dataset = TensorDataset(X_train, y_train)
-train_loader = DataLoader(train_dataset, batch_size=best_trial.params['batch_size'], shuffle=True)
+# Initialize best loss as infinity
+best_test_loss = float("inf")
 
-best_model.train()
-for epoch in range(100):
-    for batch_X, batch_y in train_loader:
+# Training loop
+model.train()
+for epoch in range(10):  # Adjust epochs as necessary
+    epoch_loss = 0
+    print(f"Starting epoch {epoch+1}")
+    for batch_idx, batch in enumerate(train_loader):
+        fen = batch["FEN"].to(device)
+        moves = batch["Moves"].to(device)
+        captures = batch["Captures"].to(device).view(-1, 1)
+        sacrifices = batch["Sacrifices"].to(device).view(-1, 1)
+        sol_length = batch["SolutionLength"].to(device).view(-1, 1)
+        inputs = torch.cat(
+            (fen, moves.view(moves.size(0), -1), captures, sacrifices, sol_length),
+            dim=1,
+        )
+        targets = (
+            batch["Rating"].to(device).view(-1, 1)
+        )  # Convert targets to float for regression
+
         optimizer.zero_grad()
-        outputs = best_model(batch_X)
-        loss = criterion(outputs, batch_y)
+        outputs = model(inputs)  # No scaling back to original range
+        loss = criterion(outputs, targets)
         loss.backward()
         optimizer.step()
 
-# Evaluate the model
-best_model.eval()
+        epoch_loss += loss.item()
+
+        if batch_idx % 100 == 0:
+            print(f"  Batch {batch_idx+1}/{len(train_loader)} - Loss: {loss.item()}")
+
+    # Calculate average loss for the epoch
+    avg_epoch_loss = epoch_loss / len(train_loader)
+    print(f"Epoch {epoch+1} Average Loss: {avg_epoch_loss}")
+
+    # Evaluate the model on the test set
+    model.eval()
+    test_loss = 0
+    all_preds = []
+    all_targets = []
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(test_loader):
+            fen = batch["FEN"].to(device)
+            moves = batch["Moves"].to(device)
+            captures = batch["Captures"].to(device).view(-1, 1)
+            sacrifices = batch["Sacrifices"].to(device).view(-1, 1)
+            sol_length = batch["SolutionLength"].to(device).view(-1, 1)
+            inputs = torch.cat(
+                (fen, moves.view(moves.size(0), -1), captures, sacrifices, sol_length),
+                dim=1,
+            )
+            outputs = model(inputs)  # No scaling back to original range
+            preds = outputs.cpu().numpy().flatten()
+            all_preds.extend(preds)
+            targets = batch["Rating"].cpu().numpy().flatten()
+            all_targets.extend(targets)
+
+            if batch_idx % 100 == 0:
+                print(f"  Batch {batch_idx+1}/{len(test_loader)}")
+
+    test_loss = mean_squared_error(all_targets, all_preds)
+    print(f"Epoch {epoch+1} Test Loss: {test_loss}")
+
+    # Save the model if it has the lowest test loss
+    if test_loss < best_test_loss:
+        best_test_loss = test_loss
+        torch.save(model.state_dict(), "best_chess_puzzle_model.pth")
+        print(f"Model saved with test loss {best_test_loss}")
+
+# Final evaluation on the test set
+model.eval()
+all_preds = []
+all_targets = []
+print("Starting final evaluation")
 with torch.no_grad():
-    y_pred = best_model(X_test).cpu().numpy().flatten()
-mse = mean_squared_error(y_test.cpu().numpy(), y_pred)
-print(f'Mean Squared Error: {mse}')
+    for batch_idx, batch in enumerate(test_loader):
+        fen = batch["FEN"].to(device)
+        moves = batch["Moves"].to(device)
+        captures = batch["Captures"].to(device).view(-1, 1)
+        sacrifices = batch["Sacrifices"].to(device).view(-1, 1)
+        sol_length = batch["SolutionLength"].to(device).view(-1, 1)
+        inputs = torch.cat(
+            (fen, moves.view(moves.size(0), -1), captures, sacrifices, sol_length),
+            dim=1,
+        )
+        outputs = model(inputs)  # No scaling back to original range
+        preds = outputs.cpu().numpy().flatten()
+        all_preds.extend(preds)
+        targets = batch["Rating"].cpu().numpy().flatten()
+        all_targets.extend(targets)
 
-# Save the best model
-torch.save(best_model.state_dict(), 'best_chess_puzzle_model.pth')
+        if batch_idx % 100 == 0:
+            print(f"  Batch {batch_idx+1}/{len(test_loader)}")
 
-# Save the best trial params
-with open('best_trial_params.txt', 'w') as f:
-    for key, value in best_trial.params.items():
-        f.write(f'{key}: {value}\n')
+# Calculate MSE
+mse = mean_squared_error(all_targets, all_preds)
+print(f"Mean Squared Error: {mse}")
